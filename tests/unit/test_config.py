@@ -9,6 +9,7 @@ from oswald.config import Settings
 def test_default_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify default application settings without external env files."""
     monkeypatch.setattr(Settings, "model_config", SettingsConfigDict(env_file=None, extra="ignore"))
+    monkeypatch.delenv("LLM_PROVIDER_KEY", raising=False)
     settings = Settings()
     assert settings.llm_provider_key == "your-llm-provider-key-here"
     assert settings.llm_base_url is None
