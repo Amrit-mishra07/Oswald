@@ -10,7 +10,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import structlog
@@ -36,7 +36,7 @@ class WorktreeManager:
         command_timeout_seconds: float = 30.0,
     ) -> None:
         self.repo_path = repo_path.resolve()
-        if not (self.repo_path / ".git").exists() and not self._is_git_repo():
+        if not (self.repo_path / ".git").exists():
             raise WorktreeError(f"Provided path is not a valid Git repository: {self.repo_path}")
 
         if worktree_base_dir is not None:
@@ -47,15 +47,11 @@ class WorktreeManager:
         self.worktree_base_dir.mkdir(parents=True, exist_ok=True)
         self._timeout = command_timeout_seconds
         self._log = structlog.get_logger().bind(component="vcs.worktree")
-
-    def _is_git_repo(self) -> bool:
-        """Check if repo_path is inside a git work tree or repository."""
-        return (self.repo_path / ".git").is_dir() or (self.repo_path / ".git").is_file()
+        self._active_contexts: dict[str, WorktreeContext] = {}
 
     def _validate_task_id(self, task_id: str) -> None:
         """Enforce strict safe naming for task IDs to prevent path traversal."""
-        clean = task_id.strip()
-        if not clean or not _TASK_ID_PATTERN.match(clean):
+        if not task_id or not _TASK_ID_PATTERN.match(task_id):
             raise WorktreeError(
                 f"Invalid task_id '{task_id}'. Must be alphanumeric with dashes/underscores/dots only."
             )
@@ -92,7 +88,8 @@ class WorktreeManager:
                 timeout=self._timeout,
             )
         except TimeoutError as exc:
-            proc.kill()
+            with suppress(ProcessLookupError):
+                proc.kill()
             await proc.wait()
             raise WorktreeError(
                 f"Git command timed out after {self._timeout}s: {' '.join(cmd)}"
@@ -160,36 +157,52 @@ class WorktreeManager:
                 ]
             )
         except WorktreeError as exc:
-            # Rollback: delete branch if created and prune
-            await self._run_git(["branch", "-D", branch_name], check=False)
-            await self._run_git(["worktree", "prune"], check=False)
+            # Rollback: remove worktree first, then prune, and finally delete branch
+            await self._run_git(
+                ["worktree", "remove", "--force", str(worktree_path)],
+                check=False,
+            )
             if worktree_path.exists():
                 shutil.rmtree(worktree_path, ignore_errors=True)
+            await self._run_git(["worktree", "prune"], check=False)
+            await self._run_git(["branch", "-D", branch_name], check=False)
             raise WorktreeError(
                 f"Failed to create worktree for task '{task_id}': {exc.message}",
                 task_id=task_id,
                 details=exc.details,
             ) from exc
 
-        return WorktreeContext(
+        # Save base commit metadata so diff against base survives process restarts
+        base_meta_path = self.worktree_base_dir / f".task-{task_id}.base"
+        with suppress(OSError):
+            base_meta_path.write_text(base_commit, encoding="utf-8")
+
+        context = WorktreeContext(
             task_id=task_id,
             worktree_path=worktree_path,
             branch_name=branch_name,
             base_ref=base_commit,
         )
+        self._active_contexts[task_id] = context
+        return context
 
-    async def get_diff(self, task_id: str) -> DiffResult:
+    async def get_diff(self, task_id: str, base_ref: str | None = None) -> DiffResult:
         """Capture the unified git diff and modified files list for a task.
 
         Runs inside the task worktree. Uses `git add -N .` to ensure newly
-        created untracked files are included in the diff.
+        created untracked files are included in the diff. Compares against the
+        original base commit the worktree was branched from, ensuring committed
+        changes are preserved in the diff.
 
         Args:
             task_id: Unique task identifier.
+            base_ref: Optional explicit base commit/ref to diff against. If omitted,
+                uses the base commit the worktree was created with.
 
         Returns:
             DiffResult containing unified diff text and list of touched files.
         """
+        self._validate_task_id(task_id)
         worktree_path = self.get_worktree_path(task_id)
         if not worktree_path.is_dir():
             raise WorktreeError(
@@ -197,15 +210,29 @@ class WorktreeManager:
                 task_id=task_id,
             )
 
+        # Resolve target base commit
+        target_base = base_ref
+        if not target_base:
+            if task_id in self._active_contexts:
+                target_base = self._active_contexts[task_id].base_ref
+            else:
+                base_meta_path = self.worktree_base_dir / f".task-{task_id}.base"
+                if base_meta_path.exists():
+                    with suppress(OSError):
+                        target_base = base_meta_path.read_text(encoding="utf-8").strip()
+
+        if not target_base:
+            target_base = "HEAD"
+
         # Intent-to-add so git diff includes newly added files
         await self._run_git(["add", "-N", "."], cwd=worktree_path, check=False)
 
-        # Capture raw unified diff against HEAD
-        _, diff_text, _ = await self._run_git(["diff", "HEAD"], cwd=worktree_path)
+        # Capture raw unified diff against the base commit
+        _, diff_text, _ = await self._run_git(["diff", target_base], cwd=worktree_path)
 
         # Capture file names
         _, name_list, _ = await self._run_git(
-            ["diff", "--name-only", "HEAD"],
+            ["diff", "--name-only", target_base],
             cwd=worktree_path,
         )
         files_changed = [f.strip() for f in name_list.splitlines() if f.strip()]
@@ -230,6 +257,12 @@ class WorktreeManager:
         self._validate_task_id(task_id)
         worktree_path = self.get_worktree_path(task_id)
         branch_name = self.get_branch_name(task_id)
+
+        self._active_contexts.pop(task_id, None)
+        base_meta_path = self.worktree_base_dir / f".task-{task_id}.base"
+        if base_meta_path.exists():
+            with suppress(OSError):
+                base_meta_path.unlink()
 
         self._log.info("worktree.removing", task_id=task_id, path=str(worktree_path))
 

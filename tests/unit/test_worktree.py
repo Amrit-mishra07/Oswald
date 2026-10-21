@@ -75,6 +75,9 @@ async def test_invalid_task_id_rejected(manager: WorktreeManager) -> None:
         await manager.create_worktree("task with spaces")
 
     with pytest.raises(WorktreeError, match="Invalid task_id"):
+        await manager.create_worktree(" task-1 ")
+
+    with pytest.raises(WorktreeError, match="Invalid task_id"):
         await manager.create_worktree("")
 
 
@@ -134,6 +137,32 @@ async def test_get_diff_modified_and_new_files(manager: WorktreeManager) -> None
     assert "+X = 100" in diff_result.diff
 
     await manager.remove_worktree("task-diff")
+
+
+async def test_get_diff_captures_committed_changes(manager: WorktreeManager) -> None:
+    """Captures unified diff against base commit even when changes have been committed."""
+    ctx = await manager.create_worktree("task-committed")
+
+    # Modify and commit a file inside the worktree
+    (ctx.worktree_path / "README.md").write_text("# Committed Change\n")
+    await manager._run_git(["add", "README.md"], cwd=ctx.worktree_path)
+    await manager._run_git(
+        ["commit", "-m", "Agent commit inside worktree"],
+        cwd=ctx.worktree_path,
+    )
+
+    # Add an uncommitted file
+    (ctx.worktree_path / "uncommitted.txt").write_text("unstaged content\n")
+
+    diff_result: DiffResult = await manager.get_diff("task-committed")
+
+    assert diff_result.task_id == "task-committed"
+    assert "README.md" in diff_result.files_changed
+    assert "uncommitted.txt" in diff_result.files_changed
+    assert "+# Committed Change" in diff_result.diff
+    assert "+unstaged content" in diff_result.diff
+
+    await manager.remove_worktree("task-committed")
 
 
 async def test_get_diff_nonexistent_worktree_raises(manager: WorktreeManager) -> None:
