@@ -110,7 +110,7 @@ class CodeIndexer:
             for file in files:
                 if file.endswith(extensions):
                     full_path = Path(root) / file
-                    rel_path = str(full_path.relative_to(self.repo_root))
+                    rel_path = full_path.relative_to(self.repo_root).as_posix()
                     disk_files.add(rel_path)
 
                     if self.index_file(rel_path):
