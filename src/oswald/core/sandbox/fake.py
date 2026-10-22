@@ -84,11 +84,15 @@ class FakeSandboxRuntime:
                     proc.communicate(),
                     timeout=timeout_seconds,
                 )
-            except TimeoutError as exc:
-                raise SandboxTimeoutError(
-                    f"Command timed out after {timeout_seconds}s: {' '.join(cmd)}",
-                    task_id=self._config.task_id,
-                ) from exc
+            except (TimeoutError, asyncio.CancelledError) as exc:
+                proc.kill()
+                await proc.wait()
+                if isinstance(exc, TimeoutError):
+                    raise SandboxTimeoutError(
+                        f"Command timed out after {timeout_seconds}s: {' '.join(cmd)}",
+                        task_id=self._config.task_id,
+                    ) from exc
+                raise
 
             return ExecResult(
                 exit_code=proc.returncode if proc.returncode is not None else 0,

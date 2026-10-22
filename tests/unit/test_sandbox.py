@@ -1,6 +1,6 @@
-"""Unit tests for the sandbox execution subsystem."""
-
+import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +13,7 @@ from oswald.core.sandbox import (
     SandboxError,
     SandboxRuntime,
     SandboxStatus,
+    SandboxTimeoutError,
 )
 
 
@@ -41,6 +42,7 @@ def test_sandbox_config_defaults(tmp_path: Path) -> None:
     assert cfg.network_disabled is True
     assert cfg.user == "1000:1000"
     assert "/tmp" in cfg.tmpfs_mounts  # noqa: S108
+    assert cfg.max_output_bytes == 10 * 1024 * 1024
 
 
 def test_exec_result_attributes() -> None:
@@ -156,3 +158,69 @@ async def test_docker_sandbox_start_nonexistent_workspace(tmp_path: Path) -> Non
 
     with pytest.raises(SandboxError, match="does not exist or is not a directory"):
         await runtime.start()
+
+
+async def test_docker_sandbox_start_cancellation_cleans_up(sample_config: SandboxConfig) -> None:
+    """Cancelling start() triggers docker rm -f teardown, sets status FAILED, and re-raises."""
+    runtime = DockerSandboxRuntime(config=sample_config)
+    calls: list[list[str]] = []
+
+    async def mock_run_docker(args: list[str], **kwargs: object) -> tuple[int, str, str]:
+        calls.append(list(args))
+        if "run" in args:
+            raise asyncio.CancelledError()
+        return 0, "", ""
+
+    runtime._run_docker = mock_run_docker  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.start()
+
+    assert runtime.status == SandboxStatus.FAILED
+    assert any("rm" in c and "-f" in c and runtime.container_name in c for c in calls)
+
+
+async def test_docker_sandbox_output_limit_exceeded(sample_config: SandboxConfig) -> None:
+    """_read_stream raises SandboxError when stream output exceeds max_output_bytes limit."""
+    runtime = DockerSandboxRuntime(config=sample_config)
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"x" * 100)
+    reader.feed_eof()
+
+    with pytest.raises(SandboxError, match="exceeded limit of 50 bytes"):
+        await runtime._read_stream(reader, limit=50)
+
+
+async def test_docker_sandbox_exec_timeout_kills_container(sample_config: SandboxConfig) -> None:
+    """SandboxTimeoutError during exec_command terminates container to stop runaway processes."""
+    runtime = DockerSandboxRuntime(config=sample_config)
+    runtime._status = SandboxStatus.RUNNING
+
+    calls: list[list[str]] = []
+
+    async def mock_run_docker(args: list[str], **kwargs: object) -> tuple[int, str, str]:
+        calls.append(list(args))
+        if "exec" in args:
+            raise SandboxTimeoutError("timed out", task_id="task-42")
+        return 0, "", ""
+
+    runtime._run_docker = mock_run_docker  # type: ignore[method-assign]
+    runtime.is_running = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    with pytest.raises(SandboxTimeoutError):
+        await runtime.exec_command(["sleep", "100"])
+
+    assert runtime.status == SandboxStatus.FAILED
+    assert any("kill" in c and runtime.container_name in c for c in calls)
+
+
+async def test_fake_sandbox_timeout_kills_process(sample_config: SandboxConfig) -> None:
+    """FakeSandboxRuntime with execute_locally=True terminates process on timeout."""
+    sandbox = FakeSandboxRuntime(config=sample_config, execute_locally=True)
+    await sandbox.start()
+
+    with pytest.raises(SandboxTimeoutError):
+        await sandbox.exec_command(
+            ["python", "-c", "import time; time.sleep(10)"],
+            timeout_seconds=0.1,
+        )

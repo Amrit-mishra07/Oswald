@@ -56,6 +56,20 @@ class DockerSandboxRuntime:
         """Deterministic container name for the task."""
         return f"oswald-sandbox-{self._config.task_id}"
 
+    async def _read_stream(self, stream: asyncio.StreamReader | None, limit: int) -> bytes:
+        """Read stream up to limit; abort if limit is exceeded."""
+        if stream is None:
+            return b""
+        buf = bytearray()
+        while chunk := await stream.read(64 * 1024):
+            buf.extend(chunk)
+            if len(buf) > limit:
+                raise SandboxError(
+                    f"Command output exceeded limit of {limit} bytes",
+                    task_id=self._config.task_id,
+                )
+        return bytes(buf)
+
     async def _run_docker(
         self,
         args: Sequence[str],
@@ -71,17 +85,29 @@ class DockerSandboxRuntime:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            out_task = asyncio.create_task(
+                self._read_stream(proc.stdout, self._config.max_output_bytes)
+            )
+            err_task = asyncio.create_task(
+                self._read_stream(proc.stderr, self._config.max_output_bytes)
+            )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
+                asyncio.gather(out_task, err_task),
                 timeout=timeout_seconds,
             )
-        except TimeoutError as exc:
+            await proc.wait()
+        except (TimeoutError, asyncio.CancelledError, SandboxError) as exc:
+            for task in (out_task, err_task):
+                if not task.done():
+                    task.cancel()
             proc.kill()
             await proc.wait()
-            raise SandboxTimeoutError(
-                f"Docker command timed out after {timeout_seconds}s: {' '.join(cmd)}",
-                task_id=self._config.task_id,
-            ) from exc
+            if isinstance(exc, TimeoutError):
+                raise SandboxTimeoutError(
+                    f"Docker command timed out after {timeout_seconds}s: {' '.join(cmd)}",
+                    task_id=self._config.task_id,
+                ) from exc
+            raise
         except OSError as exc:
             raise SandboxError(
                 f"Failed to execute docker binary '{self._docker_bin}': {exc}",
@@ -160,6 +186,10 @@ class DockerSandboxRuntime:
         try:
             await self._run_docker(run_args, timeout_seconds=60.0)
             self._status = SandboxStatus.RUNNING
+        except asyncio.CancelledError:
+            self._status = SandboxStatus.FAILED
+            await self._run_docker(["rm", "-f", self.container_name], check=False)
+            raise
         except Exception as exc:
             self._status = SandboxStatus.FAILED
             await self._run_docker(["rm", "-f", self.container_name], check=False)
@@ -203,11 +233,16 @@ class DockerSandboxRuntime:
                 timeout_seconds=timeout_seconds,
                 check=False,
             )
-        except SandboxTimeoutError:
-            raise SandboxTimeoutError(
-                f"Command timed out after {timeout_seconds}s: {' '.join(cmd)}",
-                task_id=self._config.task_id,
-            ) from None
+        except (SandboxTimeoutError, SandboxError) as exc:
+            # Terminate running container command to prevent runaway background execution
+            await self._run_docker(["kill", self.container_name], check=False)
+            self._status = SandboxStatus.FAILED
+            if isinstance(exc, SandboxTimeoutError):
+                raise SandboxTimeoutError(
+                    f"Command timed out after {timeout_seconds}s: {' '.join(cmd)}",
+                    task_id=self._config.task_id,
+                ) from None
+            raise
         duration = time.perf_counter() - start_time
 
         return ExecResult(
