@@ -182,6 +182,10 @@ class DockerSandboxRuntime:
             task_id=self._config.task_id,
         )
 
+        proc: asyncio.subprocess.Process | None = None
+        out_task: asyncio.Task[None] | None = None
+        err_task: asyncio.Task[None] | None = None
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -197,12 +201,13 @@ class DockerSandboxRuntime:
             await proc.wait()
         except (TimeoutError, asyncio.CancelledError, SandboxError) as exc:
             for task in (out_task, err_task):
-                if not task.done():
+                if task is not None and not task.done():
                     task.cancel()
             out_collector.close()
             err_collector.close()
-            proc.kill()
-            await proc.wait()
+            if proc is not None:
+                proc.kill()
+                await proc.wait()
             if isinstance(exc, TimeoutError):
                 raise SandboxTimeoutError(
                     f"Docker command timed out after {timeout_seconds}s: {' '.join(cmd)}",
@@ -336,7 +341,7 @@ class DockerSandboxRuntime:
                 timeout_seconds=timeout_seconds,
                 check=False,
             )
-        except (SandboxTimeoutError, SandboxError) as exc:
+        except (SandboxTimeoutError, SandboxError, asyncio.CancelledError) as exc:
             # Terminate running container command to prevent runaway background execution
             await self._run_docker(["kill", self.container_name], check=False)
             self._status = SandboxStatus.FAILED

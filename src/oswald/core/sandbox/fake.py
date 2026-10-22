@@ -72,6 +72,7 @@ class FakeSandboxRuntime:
         if self._execute_locally:
             start = time.perf_counter()
             workspace = Path(self._config.workspace_path)
+            proc: asyncio.subprocess.Process | None = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -85,8 +86,9 @@ class FakeSandboxRuntime:
                     timeout=timeout_seconds,
                 )
             except (TimeoutError, asyncio.CancelledError) as exc:
-                proc.kill()
-                await proc.wait()
+                if proc is not None:
+                    proc.kill()
+                    await proc.wait()
                 if isinstance(exc, TimeoutError):
                     raise SandboxTimeoutError(
                         f"Command timed out after {timeout_seconds}s: {' '.join(cmd)}",

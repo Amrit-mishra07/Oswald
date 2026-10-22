@@ -163,18 +163,22 @@ async def test_docker_sandbox_start_nonexistent_workspace(tmp_path: Path) -> Non
         await runtime.start()
 
 
-async def test_docker_sandbox_start_cancellation_cleans_up(sample_config: SandboxConfig) -> None:
+async def test_docker_sandbox_start_cancellation_cleans_up(
+    sample_config: SandboxConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Cancelling start() triggers docker rm -f teardown, sets status FAILED, and re-raises."""
     runtime = DockerSandboxRuntime(config=sample_config)
     calls: list[list[str]] = []
 
-    async def mock_run_docker(args: list[str], **kwargs: object) -> tuple[int, str, str]:
-        calls.append(list(args))
-        if "run" in args:
-            raise asyncio.CancelledError()
+    async def mock_run_docker(args: object, **kwargs: object) -> tuple[int, str, str]:
+        if isinstance(args, (list, tuple)):
+            calls.append(list(args))
+            if "run" in args:
+                raise asyncio.CancelledError()
         return 0, "", ""
 
-    runtime._run_docker = mock_run_docker  # type: ignore[method-assign]
+    monkeypatch.setattr(runtime, "_run_docker", mock_run_docker)
 
     with pytest.raises(asyncio.CancelledError):
         await runtime.start()
@@ -243,21 +247,25 @@ def test_stream_collector_total_output_exceeded(tmp_path: Path) -> None:
         collector.feed(b"x" * 60)
 
 
-async def test_docker_sandbox_exec_timeout_kills_container(sample_config: SandboxConfig) -> None:
+async def test_docker_sandbox_exec_timeout_kills_container(
+    sample_config: SandboxConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """SandboxTimeoutError during exec_command terminates container to stop runaway processes."""
     runtime = DockerSandboxRuntime(config=sample_config)
     runtime._status = SandboxStatus.RUNNING
 
     calls: list[list[str]] = []
 
-    async def mock_run_docker(args: list[str], **kwargs: object) -> tuple[int, str, str]:
-        calls.append(list(args))
-        if "exec" in args:
-            raise SandboxTimeoutError("timed out", task_id="task-42")
+    async def mock_run_docker(args: object, **kwargs: object) -> tuple[int, str, str]:
+        if isinstance(args, (list, tuple)):
+            calls.append(list(args))
+            if "exec" in args:
+                raise SandboxTimeoutError("timed out", task_id="task-42")
         return 0, "", ""
 
-    runtime._run_docker = mock_run_docker  # type: ignore[method-assign]
-    runtime.is_running = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(runtime, "_run_docker", mock_run_docker)
+    monkeypatch.setattr(runtime, "is_running", AsyncMock(return_value=True))
 
     with pytest.raises(SandboxTimeoutError):
         await runtime.exec_command(["sleep", "100"])
@@ -276,3 +284,46 @@ async def test_fake_sandbox_timeout_kills_process(sample_config: SandboxConfig) 
             ["python", "-c", "import time; time.sleep(10)"],
             timeout_seconds=0.1,
         )
+
+
+async def test_docker_sandbox_exec_cancellation_kills_container(
+    sample_config: SandboxConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling exec_command terminates container to prevent runaway background execution."""
+    runtime = DockerSandboxRuntime(config=sample_config)
+    runtime._status = SandboxStatus.RUNNING
+
+    calls: list[list[str]] = []
+
+    async def mock_run_docker(args: object, **kwargs: object) -> tuple[int, str, str]:
+        if isinstance(args, (list, tuple)):
+            calls.append(list(args))
+            if "exec" in args:
+                raise asyncio.CancelledError()
+        return 0, "", ""
+
+    monkeypatch.setattr(runtime, "_run_docker", mock_run_docker)
+    monkeypatch.setattr(runtime, "is_running", AsyncMock(return_value=True))
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.exec_command(["sleep", "100"])
+
+    assert runtime.status == SandboxStatus.FAILED
+    assert any("kill" in c and runtime.container_name in c for c in calls)
+
+
+async def test_docker_run_early_cancellation_clean(
+    sample_config: SandboxConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation during subprocess creation does not raise UnboundLocalError."""
+    runtime = DockerSandboxRuntime(config=sample_config)
+
+    async def mock_create_subprocess_exec(*args: object, **kwargs: object) -> object:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_create_subprocess_exec)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime._run_docker(["info"])
