@@ -45,9 +45,17 @@ class SandboxConfig(BaseModel):
         default_factory=lambda: {"/tmp": "rw,noexec,nosuid,size=512m"},  # noqa: S108
         description="Tmpfs writable scratch mounts for compilers and temporary files",
     )
-    max_output_bytes: int = Field(
-        default=10 * 1024 * 1024,
-        description="Maximum allowed stdout/stderr bytes before terminating execution",
+    max_head_bytes: int = Field(
+        default=2 * 1024 * 1024,  # 2 MiB
+        description="Maximum initial stdout/stderr bytes retained in memory",
+    )
+    max_tail_bytes: int = Field(
+        default=3 * 1024 * 1024,  # 3 MiB
+        description="Maximum trailing stdout/stderr bytes retained in memory ring buffer",
+    )
+    max_total_output_bytes: int = Field(
+        default=200 * 1024 * 1024,  # 200 MiB
+        description="Maximum allowed total stdout/stderr bytes written to disk before aborting",
     )
 
 

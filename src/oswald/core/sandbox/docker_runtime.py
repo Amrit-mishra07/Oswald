@@ -13,6 +13,7 @@ import shutil
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from typing import BinaryIO
 
 import structlog
 
@@ -22,6 +23,90 @@ from oswald.core.sandbox.exceptions import (
     SandboxTimeoutError,
 )
 from oswald.core.sandbox.models import ExecResult, SandboxConfig, SandboxStatus
+
+
+class StreamCollector:
+    """Collects stream with Head buffer (2MB), Tail ring buffer (3MB), and disk spill up to 200MB."""
+
+    def __init__(
+        self,
+        logs_dir: Path,
+        stream_name: str,
+        max_head: int = 2 * 1024 * 1024,
+        max_tail: int = 3 * 1024 * 1024,
+        max_total: int = 200 * 1024 * 1024,
+        task_id: str = "",
+    ) -> None:
+        self._logs_dir = logs_dir
+        self._stream_name = stream_name
+        self._max_head = max_head
+        self._max_tail = max_tail
+        self._max_total = max_total
+        self._task_id = task_id
+
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total_bytes = 0
+        self._file: BinaryIO | None = None
+        self.log_filename: str | None = None
+
+    def feed(self, chunk: bytes) -> None:
+        self.total_bytes += len(chunk)
+        if self.total_bytes > self._max_total:
+            self.close()
+            raise SandboxError(
+                f"Command output exceeded limit of {self._max_total} bytes",
+                task_id=self._task_id,
+            )
+
+        # Fill head first
+        if len(self.head) < self._max_head:
+            needed = self._max_head - len(self.head)
+            self.head.extend(chunk[:needed])
+            remaining = chunk[needed:]
+        else:
+            remaining = chunk
+
+        # Beyond head: write to disk spill and maintain tail ring buffer
+        if remaining or self._file is not None:
+            if self._file is None:
+                self._logs_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = int(time.time() * 1000)
+                self.log_filename = f"exec_{timestamp}_{self._stream_name}.log"
+                file_path = self._logs_dir / self.log_filename
+                self._file = open(file_path, "wb")  # noqa: SIM115
+                if self.head:
+                    self._file.write(self.head)
+
+            if remaining:
+                self._file.write(remaining)
+                self.tail.extend(remaining)
+                if len(self.tail) > self._max_tail:
+                    self.tail = self.tail[-self._max_tail :]
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def get_output(self, container_logs_prefix: str = "/workspace/.oswald/logs") -> str:
+        self.close()
+        # Small output: fit entirely in head, no spill file created
+        if self.log_filename is None:
+            return self.head.decode("utf-8", errors="replace")
+
+        # Large output: return Head + notice with container log path + Tail
+        omitted = self.total_bytes - len(self.head) - len(self.tail)
+        head_str = self.head.decode("utf-8", errors="replace")
+        tail_str = self.tail.decode("utf-8", errors="replace")
+        container_path = f"{container_logs_prefix}/{self.log_filename}"
+
+        if omitted > 0:
+            marker = (
+                f"\n\n[... {omitted:,} bytes omitted. Full log saved to {container_path} ...]\n\n"
+            )
+            return f"{head_str}{marker}{tail_str}"
+        return f"{head_str}{tail_str}"
 
 
 class DockerSandboxRuntime:
@@ -56,28 +141,46 @@ class DockerSandboxRuntime:
         """Deterministic container name for the task."""
         return f"oswald-sandbox-{self._config.task_id}"
 
-    async def _read_stream(self, stream: asyncio.StreamReader | None, limit: int) -> bytes:
-        """Read stream up to limit; abort if limit is exceeded."""
+    async def _read_stream(
+        self,
+        stream: asyncio.StreamReader | None,
+        collector: StreamCollector,
+    ) -> None:
         if stream is None:
-            return b""
-        buf = bytearray()
-        while chunk := await stream.read(64 * 1024):
-            buf.extend(chunk)
-            if len(buf) > limit:
-                raise SandboxError(
-                    f"Command output exceeded limit of {limit} bytes",
-                    task_id=self._config.task_id,
-                )
-        return bytes(buf)
+            return
+        try:
+            while chunk := await stream.read(64 * 1024):
+                collector.feed(chunk)
+        finally:
+            collector.close()
 
     async def _run_docker(
         self,
         args: Sequence[str],
         timeout_seconds: float = 30.0,
         check: bool = True,
+        logs_dir: Path | None = None,
     ) -> tuple[int, str, str]:
         """Execute a docker CLI command asynchronously."""
         cmd = [self._docker_bin, *args]
+        target_logs_dir = logs_dir or (self._workspace_path / ".oswald" / "logs")
+
+        out_collector = StreamCollector(
+            logs_dir=target_logs_dir,
+            stream_name="stdout",
+            max_head=self._config.max_head_bytes,
+            max_tail=self._config.max_tail_bytes,
+            max_total=self._config.max_total_output_bytes,
+            task_id=self._config.task_id,
+        )
+        err_collector = StreamCollector(
+            logs_dir=target_logs_dir,
+            stream_name="stderr",
+            max_head=self._config.max_head_bytes,
+            max_tail=self._config.max_tail_bytes,
+            max_total=self._config.max_total_output_bytes,
+            task_id=self._config.task_id,
+        )
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -85,13 +188,9 @@ class DockerSandboxRuntime:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            out_task = asyncio.create_task(
-                self._read_stream(proc.stdout, self._config.max_output_bytes)
-            )
-            err_task = asyncio.create_task(
-                self._read_stream(proc.stderr, self._config.max_output_bytes)
-            )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            out_task = asyncio.create_task(self._read_stream(proc.stdout, out_collector))
+            err_task = asyncio.create_task(self._read_stream(proc.stderr, err_collector))
+            await asyncio.wait_for(
                 asyncio.gather(out_task, err_task),
                 timeout=timeout_seconds,
             )
@@ -100,6 +199,8 @@ class DockerSandboxRuntime:
             for task in (out_task, err_task):
                 if not task.done():
                     task.cancel()
+            out_collector.close()
+            err_collector.close()
             proc.kill()
             await proc.wait()
             if isinstance(exc, TimeoutError):
@@ -109,13 +210,15 @@ class DockerSandboxRuntime:
                 ) from exc
             raise
         except OSError as exc:
+            out_collector.close()
+            err_collector.close()
             raise SandboxError(
                 f"Failed to execute docker binary '{self._docker_bin}': {exc}",
                 task_id=self._config.task_id,
             ) from exc
 
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        stdout = out_collector.get_output()
+        stderr = err_collector.get_output()
         exit_code = proc.returncode if proc.returncode is not None else 1
 
         if check and exit_code != 0:

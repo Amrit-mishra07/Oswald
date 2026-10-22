@@ -15,6 +15,7 @@ from oswald.core.sandbox import (
     SandboxStatus,
     SandboxTimeoutError,
 )
+from oswald.core.sandbox.docker_runtime import StreamCollector
 
 
 @pytest.fixture
@@ -42,7 +43,9 @@ def test_sandbox_config_defaults(tmp_path: Path) -> None:
     assert cfg.network_disabled is True
     assert cfg.user == "1000:1000"
     assert "/tmp" in cfg.tmpfs_mounts  # noqa: S108
-    assert cfg.max_output_bytes == 10 * 1024 * 1024
+    assert cfg.max_head_bytes == 2 * 1024 * 1024
+    assert cfg.max_tail_bytes == 3 * 1024 * 1024
+    assert cfg.max_total_output_bytes == 200 * 1024 * 1024
 
 
 def test_exec_result_attributes() -> None:
@@ -180,15 +183,64 @@ async def test_docker_sandbox_start_cancellation_cleans_up(sample_config: Sandbo
     assert any("rm" in c and "-f" in c and runtime.container_name in c for c in calls)
 
 
-async def test_docker_sandbox_output_limit_exceeded(sample_config: SandboxConfig) -> None:
-    """_read_stream raises SandboxError when stream output exceeds max_output_bytes limit."""
-    runtime = DockerSandboxRuntime(config=sample_config)
-    reader = asyncio.StreamReader()
-    reader.feed_data(b"x" * 100)
-    reader.feed_eof()
+def test_stream_collector_small_output(tmp_path: Path) -> None:
+    """Small output <= max_head is kept in memory with no spill file created on disk."""
+    logs_dir = tmp_path / ".oswald" / "logs"
+    collector = StreamCollector(logs_dir=logs_dir, stream_name="stdout", max_head=100, max_tail=50)
+
+    collector.feed(b"Small output line 1\n")
+    collector.feed(b"Small output line 2\n")
+
+    res = collector.get_output()
+    assert res == "Small output line 1\nSmall output line 2\n"
+    assert not logs_dir.exists()
+
+
+def test_stream_collector_large_output_spill(tmp_path: Path) -> None:
+    """Large output exceeding max_head spills full log to disk and formats head + tail in memory."""
+    logs_dir = tmp_path / ".oswald" / "logs"
+    collector = StreamCollector(
+        logs_dir=logs_dir,
+        stream_name="stdout",
+        max_head=20,
+        max_tail=20,
+        max_total=1000,
+    )
+
+    collector.feed(b"HEAD_SECTION_1234567")  # 20 bytes: fills head
+    collector.feed(b"MIDDLE_SECTION_LONG_OMITTED_DATA_HERE")  # 37 bytes: spilled to disk
+    collector.feed(b"TAIL_SECTION_7654321")  # 20 bytes: fills tail
+
+    res = collector.get_output()
+    # Verifies head and tail are present in memory
+    assert "HEAD_SECTION_1234567" in res
+    assert "TAIL_SECTION_7654321" in res
+    assert "bytes omitted. Full log saved to /workspace/.oswald/logs/" in res
+
+    # Verifies full raw log is preserved on disk
+    assert logs_dir.exists()
+    assert collector.log_filename is not None
+    saved_file = logs_dir / collector.log_filename
+    assert saved_file.exists()
+    assert (
+        saved_file.read_bytes()
+        == b"HEAD_SECTION_1234567MIDDLE_SECTION_LONG_OMITTED_DATA_HERETAIL_SECTION_7654321"
+    )
+
+
+def test_stream_collector_total_output_exceeded(tmp_path: Path) -> None:
+    """StreamCollector raises SandboxError when total output exceeds max_total."""
+    logs_dir = tmp_path / ".oswald" / "logs"
+    collector = StreamCollector(
+        logs_dir=logs_dir,
+        stream_name="stdout",
+        max_head=10,
+        max_tail=10,
+        max_total=50,
+    )
 
     with pytest.raises(SandboxError, match="exceeded limit of 50 bytes"):
-        await runtime._read_stream(reader, limit=50)
+        collector.feed(b"x" * 60)
 
 
 async def test_docker_sandbox_exec_timeout_kills_container(sample_config: SandboxConfig) -> None:
