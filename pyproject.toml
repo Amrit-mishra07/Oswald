@@ -18,6 +18,7 @@ dependencies = [
     "structlog>=26.1.0",
     "taskiq>=0.11.0",
     "taskiq-redis>=1.0.0",
+    "tree-sitter-language-pack>=1.22.1",
 ]
 
 [dependency-groups]
