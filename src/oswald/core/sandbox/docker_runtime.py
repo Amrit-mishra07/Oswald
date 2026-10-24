@@ -9,9 +9,11 @@ Launches and manages task-scoped Docker containers with restricted capabilities:
 """
 
 import asyncio
+import os
 import shutil
 import time
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import BinaryIO
 
@@ -26,12 +28,12 @@ from oswald.core.sandbox.models import ExecResult, SandboxConfig, SandboxStatus
 
 
 class StreamCollector:
-    """Collects stream with Head buffer (2MB), Tail ring buffer (3MB), and disk spill up to 200MB."""
+    """Streams command output directly to disk if logs_dir is provided, else buffers in memory."""
 
     def __init__(
         self,
-        logs_dir: Path,
-        stream_name: str,
+        logs_dir: Path | None = None,
+        stream_name: str = "stdout",
         max_head: int = 2 * 1024 * 1024,
         max_tail: int = 3 * 1024 * 1024,
         max_total: int = 200 * 1024 * 1024,
@@ -44,13 +46,48 @@ class StreamCollector:
         self._max_total = max_total
         self._task_id = task_id
 
-        self.head = bytearray()
-        self.tail = bytearray()
         self.total_bytes = 0
         self._file: BinaryIO | None = None
+        self._file_path: Path | None = None
         self.log_filename: str | None = None
+        self._mem_buffer: bytearray | None = bytearray() if logs_dir is None else None
+
+    def _ensure_no_symlinks(self, target: Path) -> None:
+        if self._logs_dir is None:
+            return
+        for candidate in (target, self._logs_dir, self._logs_dir.parent):
+            if candidate.is_symlink():
+                raise SandboxError(
+                    f"Refusing to access symlinked log path: {candidate}",
+                    task_id=self._task_id,
+                )
+
+    def _open_log_file(self) -> BinaryIO:
+        if self._logs_dir is None:
+            raise SandboxError("Logs directory is not configured", task_id=self._task_id)
+        self._ensure_no_symlinks(self._logs_dir)
+        self._logs_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_no_symlinks(self._logs_dir)
+
+        timestamp = time.time_ns()
+        prefix = f"{self._task_id}_" if self._task_id else ""
+        self.log_filename = f"exec_{prefix}{timestamp}_{self._stream_name}.log"
+        self._file_path = self._logs_dir / self.log_filename
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self._file_path, flags, 0o600)
+        except OSError as exc:
+            raise SandboxError(
+                f"Failed to safely open log file '{self._file_path}': {exc}",
+                task_id=self._task_id,
+            ) from exc
+        return os.fdopen(fd, "wb")
 
     def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+
         self.total_bytes += len(chunk)
         if self.total_bytes > self._max_total:
             self.close()
@@ -59,54 +96,56 @@ class StreamCollector:
                 task_id=self._task_id,
             )
 
-        # Fill head first
-        if len(self.head) < self._max_head:
-            needed = self._max_head - len(self.head)
-            self.head.extend(chunk[:needed])
-            remaining = chunk[needed:]
-        else:
-            remaining = chunk
-
-        # Beyond head: write to disk spill and maintain tail ring buffer
-        if remaining or self._file is not None:
+        if self._logs_dir is not None:
             if self._file is None:
-                self._logs_dir.mkdir(parents=True, exist_ok=True)
-                timestamp = int(time.time() * 1000)
-                self.log_filename = f"exec_{timestamp}_{self._stream_name}.log"
-                file_path = self._logs_dir / self.log_filename
-                self._file = open(file_path, "wb")  # noqa: SIM115
-                if self.head:
-                    self._file.write(self.head)
-
-            if remaining:
-                self._file.write(remaining)
-                self.tail.extend(remaining)
-                if len(self.tail) > self._max_tail:
-                    self.tail = self.tail[-self._max_tail :]
+                self._file = self._open_log_file()
+            self._file.write(chunk)
+        elif self._mem_buffer is not None:
+            self._mem_buffer.extend(chunk)
 
     def close(self) -> None:
         if self._file is not None:
-            self._file.close()
+            if not self._file.closed:
+                self._file.close()
             self._file = None
 
     def get_output(self, container_logs_prefix: str = "/workspace/.oswald/logs") -> str:
         self.close()
-        # Small output: fit entirely in head, no spill file created
-        if self.log_filename is None:
-            return self.head.decode("utf-8", errors="replace")
 
-        # Large output: return Head + notice with container log path + Tail
-        omitted = self.total_bytes - len(self.head) - len(self.tail)
-        head_str = self.head.decode("utf-8", errors="replace")
-        tail_str = self.tail.decode("utf-8", errors="replace")
+        if self._logs_dir is None and self._mem_buffer is not None:
+            return self._mem_buffer.decode("utf-8", errors="replace")
+
+        if self._file_path is None or not self._file_path.exists():
+            return ""
+
+        self._ensure_no_symlinks(self._file_path)
+        read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self._file_path, read_flags)
+        with os.fdopen(fd, "rb") as f:
+            if self.total_bytes <= (self._max_head + self._max_tail):
+                return f.read().decode("utf-8", errors="replace")
+            head_bytes = f.read(self._max_head)
+            f.seek(self.total_bytes - self._max_tail)
+            tail_bytes = f.read(self._max_tail)
+
+        head_str = head_bytes.decode("utf-8", errors="replace")
+        tail_str = tail_bytes.decode("utf-8", errors="replace")
+        omitted = self.total_bytes - self._max_head - self._max_tail
         container_path = f"{container_logs_prefix}/{self.log_filename}"
 
-        if omitted > 0:
-            marker = (
-                f"\n\n[... {omitted:,} bytes omitted. Full log saved to {container_path} ...]\n\n"
-            )
-            return f"{head_str}{marker}{tail_str}"
-        return f"{head_str}{tail_str}"
+        marker = f"\n\n[... {omitted:,} bytes omitted. Full log saved to {container_path} ...]\n\n"
+        return f"{head_str}{marker}{tail_str}"
+
+    def __enter__(self) -> "StreamCollector":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        self.close()
 
 
 class DockerSandboxRuntime:
@@ -141,6 +180,14 @@ class DockerSandboxRuntime:
         """Deterministic container name for the task."""
         return f"oswald-sandbox-{self._config.task_id}"
 
+    @staticmethod
+    async def _drain_stream(stream: asyncio.StreamReader | None) -> None:
+        if stream is None:
+            return
+        with suppress(Exception):
+            while await stream.read(64 * 1024):
+                pass
+
     async def _read_stream(
         self,
         stream: asyncio.StreamReader | None,
@@ -148,11 +195,9 @@ class DockerSandboxRuntime:
     ) -> None:
         if stream is None:
             return
-        try:
+        with collector:
             while chunk := await stream.read(64 * 1024):
                 collector.feed(chunk)
-        finally:
-            collector.close()
 
     async def _run_docker(
         self,
@@ -163,10 +208,9 @@ class DockerSandboxRuntime:
     ) -> tuple[int, str, str]:
         """Execute a docker CLI command asynchronously."""
         cmd = [self._docker_bin, *args]
-        target_logs_dir = logs_dir or (self._workspace_path / ".oswald" / "logs")
 
         out_collector = StreamCollector(
-            logs_dir=target_logs_dir,
+            logs_dir=logs_dir,
             stream_name="stdout",
             max_head=self._config.max_head_bytes,
             max_tail=self._config.max_tail_bytes,
@@ -174,7 +218,7 @@ class DockerSandboxRuntime:
             task_id=self._config.task_id,
         )
         err_collector = StreamCollector(
-            logs_dir=target_logs_dir,
+            logs_dir=logs_dir,
             stream_name="stderr",
             max_head=self._config.max_head_bytes,
             max_tail=self._config.max_tail_bytes,
@@ -195,19 +239,30 @@ class DockerSandboxRuntime:
             out_task = asyncio.create_task(self._read_stream(proc.stdout, out_collector))
             err_task = asyncio.create_task(self._read_stream(proc.stderr, err_collector))
             await asyncio.wait_for(
-                asyncio.gather(out_task, err_task),
+                asyncio.gather(proc.wait(), out_task, err_task),
                 timeout=timeout_seconds,
             )
-            await proc.wait()
         except (TimeoutError, asyncio.CancelledError, SandboxError) as exc:
+            if proc is not None and proc.returncode is None:
+                with suppress(ProcessLookupError):
+                    proc.kill()
             for task in (out_task, err_task):
                 if task is not None and not task.done():
                     task.cancel()
+            if out_task or err_task:
+                await asyncio.gather(
+                    *(t for t in (out_task, err_task) if t is not None),
+                    return_exceptions=True,
+                )
             out_collector.close()
             err_collector.close()
             if proc is not None:
-                proc.kill()
-                await proc.wait()
+                await asyncio.gather(
+                    proc.wait(),
+                    self._drain_stream(proc.stdout),
+                    self._drain_stream(proc.stderr),
+                    return_exceptions=True,
+                )
             if isinstance(exc, TimeoutError):
                 raise SandboxTimeoutError(
                     f"Docker command timed out after {timeout_seconds}s: {' '.join(cmd)}",
@@ -253,16 +308,21 @@ class DockerSandboxRuntime:
         run_args: list[str] = [
             "run",
             "-d",
+            "--init",
             "--name",
             self.container_name,
             "-w",
             "/workspace",
+            "-e",
+            "HOME=/tmp",
             "-v",
             workspace_mount,
             "--memory",
             self._config.memory_limit,
             "--cpus",
             str(self._config.cpus),
+            "--pids-limit",
+            str(self._config.pids_limit),
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -319,12 +379,6 @@ class DockerSandboxRuntime:
                 task_id=self._config.task_id,
             )
 
-        if not await self.is_running():
-            raise ContainerNotRunningError(
-                f"Cannot execute command: sandbox container '{self.container_name}' is not running",
-                task_id=self._config.task_id,
-            )
-
         exec_args = ["exec", "-i", "-w", "/workspace"]
 
         if env:
@@ -340,9 +394,9 @@ class DockerSandboxRuntime:
                 exec_args,
                 timeout_seconds=timeout_seconds,
                 check=False,
+                logs_dir=self._workspace_path / ".oswald" / "logs",
             )
         except (SandboxTimeoutError, SandboxError, asyncio.CancelledError) as exc:
-            # Terminate running container command to prevent runaway background execution
             await self._run_docker(["kill", self.container_name], check=False)
             self._status = SandboxStatus.FAILED
             if isinstance(exc, SandboxTimeoutError):
@@ -352,6 +406,18 @@ class DockerSandboxRuntime:
                 ) from None
             raise
         duration = time.perf_counter() - start_time
+
+        stderr_lower = stderr.lower()
+        if (
+            exit_code != 0
+            and "error response from daemon:" in stderr_lower
+            and ("is not running" in stderr_lower or "no such container" in stderr_lower)
+        ):
+            self._status = SandboxStatus.STOPPED
+            raise ContainerNotRunningError(
+                f"Cannot execute command: sandbox container '{self.container_name}' is not running: {stderr.strip()}",
+                task_id=self._config.task_id,
+            )
 
         return ExecResult(
             exit_code=exit_code,
