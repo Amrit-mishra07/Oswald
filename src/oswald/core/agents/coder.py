@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from oswald.core.artifacts.models import CodeChanges, Finding, PlanSpec
 from oswald.core.codeindex.indexer import CodeIndexer
+from oswald.core.llm.exceptions import LLMError
 from oswald.core.llm.protocol import LLMClient
 from oswald.core.llm.types import (
     LLMRequest,
@@ -190,6 +191,7 @@ class CoderAgent:
         self,
         call: ToolCall,
         target_files: list[str],
+        task_id: str,
     ) -> tuple[str, bool]:
         """Dispatch a single tool call and return (output_text, is_success)."""
         args = call.arguments
@@ -197,34 +199,37 @@ class CoderAgent:
 
         try:
             if name == "read_file_range":
-                file_path = str(args.get("file_path", ""))
-                start = int(args.get("start_line", 1))
-                end = int(args["end_line"]) if "end_line" in args else None
+                file_path = str(args.get("file_path") or "")
+                start = int(args.get("start_line") or 1)
+                end_val = args.get("end_line")
+                end = int(end_val) if end_val is not None else None
                 out = read_file_range(self.workspace_root, file_path, start, end)
                 return out, not out.startswith("Error:")
 
             elif name == "search_code":
-                query = str(args.get("query", ""))
+                query = str(args.get("query") or "")
                 file_pat = args.get("file_pattern")
                 is_re = bool(args.get("is_regex", False))
                 out = search_code(self.workspace_root, query, file_pat, is_re)
                 return out, not out.startswith("Error:")
 
             elif name == "list_files":
-                directory = str(args.get("directory", "."))
+                directory = str(args.get("directory") or ".")
                 recursive = bool(args.get("recursive", True))
                 out = list_files(self.workspace_root, directory, recursive)
                 return out, not out.startswith("Error:")
 
             elif name == "read_symbol":
-                symbol = str(args.get("symbol_name", ""))
+                symbol = str(args.get("symbol_name") or "")
                 out = read_symbol(self.workspace_root, symbol, self.indexer)
                 return out, not out.startswith("Error:")
 
             elif name == "edit_file":
-                file_path = str(args.get("file_path", ""))
-                old_str = str(args.get("old_str", ""))
-                new_str = str(args.get("new_str", ""))
+                file_path = str(args.get("file_path") or "")
+                old_val = args.get("old_str")
+                old_str = "" if old_val is None else str(old_val)
+                new_val = args.get("new_str")
+                new_str = "" if new_val is None else str(new_val)
                 res = edit_file(
                     self.workspace_root,
                     file_path,
@@ -238,7 +243,7 @@ class CoderAgent:
                 return res.message, res.success
 
             elif name == "run_static_check":
-                check_name = str(args.get("check_name", ""))
+                check_name = str(args.get("check_name") or "")
                 check_res = await run_static_check(self.sandbox, check_name)
                 return (
                     f"Check: {check_res.check_name} | Passed: {check_res.passed} (exit {check_res.exit_code})\n{check_res.output}",
@@ -246,7 +251,7 @@ class CoderAgent:
                 )
 
             elif name == "check_declared_imports":
-                changed = await self.workspace_diff.changed_files(str(self.workspace_root))
+                changed = await self.workspace_diff.changed_files(task_id)
                 warnings = check_declared_imports(self.workspace_root, changed)
                 if warnings:
                     return "\n".join(warnings), False
@@ -263,8 +268,7 @@ class CoderAgent:
         clean = text.strip()
         candidates: list[str] = []
 
-        match = _JSON_BLOCK_REGEX.search(clean)
-        if match:
+        for match in _JSON_BLOCK_REGEX.finditer(clean):
             candidates.append(match.group(1))
 
         first_brace = clean.find("{")
@@ -303,14 +307,23 @@ class CoderAgent:
         for turn in range(1, self.max_turns + 1):
             self.budget_guard.check(input_data.task_id)
 
-            response = await self.llm.complete(
-                LLMRequest(
-                    model=self.model,
-                    messages=messages,
-                    tools=CODER_TOOL_DEFINITIONS,
-                    temperature=0.0,
+            try:
+                response = await self.llm.complete(
+                    LLMRequest(
+                        model=self.model,
+                        messages=messages,
+                        tools=CODER_TOOL_DEFINITIONS,
+                        temperature=0.0,
+                    )
                 )
-            )
+            except LLMError as exc:
+                final_draft = {
+                    "status": "ESCALATED",
+                    "summary": f"LLM error encountered: {exc}",
+                    "content": f"# LLM Error\nExecution halted due to LLM failure: {exc}",
+                    "escalation": f"LLM call raised {type(exc).__name__}: {exc}",
+                }
+                break
 
             await self.event_sink.emit(
                 RunEvent(
@@ -339,7 +352,7 @@ class CoderAgent:
                 circuit_broken = False
                 for tc in response.tool_calls:
                     output_text, success = await self._execute_tool_call(
-                        tc, input_data.spec.target_files
+                        tc, input_data.spec.target_files, input_data.task_id
                     )
 
                     # Circuit breaker check: detect 3 repeated identical failures
@@ -455,8 +468,10 @@ class CoderAgent:
             return changes
 
         # COMPLETED path: verify scope whitelist against git diff
-        whitelist_set = {f.strip().lstrip("./") for f in input_data.spec.target_files}
-        clean_changed = [f.strip().lstrip("./") for f in changed_files]
+        whitelist_set = {
+            f.strip().removeprefix("./").removeprefix("/") for f in input_data.spec.target_files
+        }
+        clean_changed = [f.strip().removeprefix("./").removeprefix("/") for f in changed_files]
         scope_violations = [f for f in clean_changed if f not in whitelist_set]
 
         if scope_violations:

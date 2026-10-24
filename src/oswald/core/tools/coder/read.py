@@ -19,17 +19,80 @@ def truncate_output(text: str, max_bytes: int = MAX_TOOL_OUTPUT_BYTES) -> str:
     return f"{truncated}\n\n[... Output truncated: exceeded {max_bytes} bytes ceiling ...]"
 
 
+def normalize_workspace_rel_path(workspace_root: Path, path_str: str) -> str:
+    """Normalize a path to be strictly relative to workspace_root.
+
+    Handles absolute paths inside the workspace, leading slashes, and ./ prefixes.
+    Raises PermissionError on traversal outside workspace.
+    """
+    clean = path_str.strip()
+    if not clean:
+        return ""
+    ws = workspace_root.resolve()
+    p = Path(clean)
+    if p.is_absolute():
+        try:
+            if p.resolve().is_relative_to(ws):
+                return p.resolve().relative_to(ws).as_posix()
+        except (ValueError, RuntimeError):
+            pass
+
+        if clean == "/workspace" or clean.startswith("/workspace/"):
+            cand = clean.removeprefix("/workspace").lstrip("/")
+            return cand
+
+        # Known system root directories on host Linux/Unix systems
+        system_roots = {
+            "etc",
+            "var",
+            "usr",
+            "home",
+            "root",
+            "tmp",
+            "opt",
+            "bin",
+            "sbin",
+            "lib",
+            "dev",
+            "proc",
+            "sys",
+            "private",
+        }
+        if p.exists() or (len(p.parts) > 1 and p.parts[1] in system_roots):
+            raise PermissionError(
+                f"Path traversal detected: '{path_str}' resolves outside workspace"
+            )
+
+        rel_cand = clean.lstrip("/")
+        resolved = (ws / rel_cand).resolve()
+        if not resolved.is_relative_to(ws):
+            raise PermissionError(
+                f"Path traversal detected: '{path_str}' resolves outside workspace"
+            )
+        return rel_cand
+
+    while clean.startswith("./") or clean.startswith("/"):
+        if clean.startswith("./"):
+            clean = clean.removeprefix("./")
+        if clean.startswith("/"):
+            clean = clean.removeprefix("/")
+    return clean
+
+
 def validate_workspace_path(workspace_root: Path, rel_path: str) -> Path:
     """Ensure path resolves strictly within the workspace worktree and rejects symlinks."""
+    clean_rel = normalize_workspace_rel_path(workspace_root, rel_path)
+    if not clean_rel:
+        raise FileNotFoundError("Empty file path provided")
     ws = workspace_root.resolve()
-    target = (ws / rel_path).resolve()
+    target = (ws / clean_rel).resolve()
 
     if not target.is_relative_to(ws):
         raise PermissionError(f"Path traversal detected: '{rel_path}' resolves outside workspace")
 
     # Check that no existing path component in workspace is a symlink pointing outside
     current = ws
-    for part in Path(rel_path).parts:
+    for part in Path(clean_rel).parts:
         current = current / part
         if current.is_symlink():
             resolved_link = current.resolve()
@@ -48,7 +111,11 @@ def read_file_range(
     end_line: int | None = None,
 ) -> str:
     """Read a specific slice of lines from a workspace file (1-indexed, inclusive)."""
-    target = validate_workspace_path(workspace_root, file_path)
+    try:
+        target = validate_workspace_path(workspace_root, file_path)
+    except FileNotFoundError:
+        return f"Error: File '{file_path}' does not exist"
+
     if not target.is_file():
         return f"Error: File '{file_path}' does not exist"
 
@@ -63,6 +130,8 @@ def read_file_range(
     total_lines = len(lines)
     if start_line < 1:
         start_line = 1
+    if end_line is not None and start_line > end_line:
+        return f"Error: start_line ({start_line}) cannot be greater than end_line ({end_line})"
     if end_line is None or end_line > total_lines:
         end_line = total_lines
 
@@ -137,6 +206,9 @@ def search_code(
     max_matches: int = 50,
 ) -> str:
     """Search code across workspace files with regex or literal matching."""
+    if not query or not query.strip():
+        return "Error: Search query cannot be empty"
+
     ws = workspace_root.resolve()
     excluded_dirs = {
         ".git",

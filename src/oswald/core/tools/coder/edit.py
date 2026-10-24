@@ -4,7 +4,10 @@ import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 
-from oswald.core.tools.coder.read import validate_workspace_path
+from oswald.core.tools.coder.read import (
+    normalize_workspace_rel_path,
+    validate_workspace_path,
+)
 
 PROTECTED_PATTERNS = [
     "pyproject.toml",
@@ -35,9 +38,17 @@ class EditResult:
 
 def is_test_path(rel_path: str) -> bool:
     """Return True if path is a test file or located within a tests directory."""
-    p = Path(rel_path)
+    clean = rel_path.strip()
+    while clean.startswith("./") or clean.startswith("/"):
+        if clean.startswith("./"):
+            clean = clean.removeprefix("./")
+        if clean.startswith("/"):
+            clean = clean.removeprefix("/")
+    p = Path(clean)
     parts = p.parts
     if "tests" in parts or "test" in parts:
+        return True
+    if p.name in ("conftest.py", "tests.py"):
         return True
     return fnmatch.fnmatch(p.name, "test_*.py") or fnmatch.fnmatch(p.name, "*_test.py")
 
@@ -75,11 +86,18 @@ def edit_file(
         3. Protected paths guard: Manifests/lockfiles/CI require explicit whitelist inclusion.
         4. Symlink/Traversal guard: Target and parents must remain within workspace.
     """
-    clean_path = file_path.strip()
-    while clean_path.startswith("./"):
-        clean_path = clean_path.removeprefix("./")
+    try:
+        clean_path = normalize_workspace_rel_path(workspace_root, file_path)
+    except PermissionError as exc:
+        return EditResult(
+            success=False,
+            file_path=file_path,
+            message=f"SecurityError: {exc}",
+        )
 
-    clean_whitelist = [f.strip().removeprefix("./") for f in target_files_whitelist]
+    clean_whitelist = [
+        normalize_workspace_rel_path(workspace_root, f) for f in target_files_whitelist
+    ]
 
     # Guard 1: Whitelist check
     if clean_path not in clean_whitelist:
