@@ -1,4 +1,7 @@
 import asyncio
+import os
+import sys
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -35,17 +38,31 @@ def test_sandbox_config_defaults(tmp_path: Path) -> None:
     """SandboxConfig enforces hardened security and resource defaults."""
     cfg = SandboxConfig(task_id="task-1", workspace_path=tmp_path)
 
+    expected_uid = getattr(os, "getuid", lambda: 1000)()
+    expected_gid = getattr(os, "getgid", lambda: 1000)()
+    expected_user = f"{expected_uid}:{expected_gid}" if expected_uid != 0 else "1000:1000"
+
     assert cfg.task_id == "task-1"
     assert cfg.image == "python:3.12-slim"
     assert cfg.memory_limit == "2g"
     assert cfg.cpus == 2.0
+    assert cfg.pids_limit == 512
     assert cfg.read_only_root is True
     assert cfg.network_disabled is True
-    assert cfg.user == "1000:1000"
-    assert "/tmp" in cfg.tmpfs_mounts  # noqa: S108
+    assert cfg.user == expected_user
+    assert cfg.tmpfs_mounts.get("/tmp") == "rw,nosuid,nodev,size=512m"  # noqa: S108
     assert cfg.max_head_bytes == 2 * 1024 * 1024
     assert cfg.max_tail_bytes == 3 * 1024 * 1024
     assert cfg.max_total_output_bytes == 200 * 1024 * 1024
+
+
+def test_sandbox_config_invalid_task_id(tmp_path: Path) -> None:
+    """SandboxConfig rejects path traversal and malformed task IDs."""
+    with pytest.raises(ValueError):
+        SandboxConfig(task_id="../escape", workspace_path=tmp_path)
+
+    with pytest.raises(ValueError):
+        SandboxConfig(task_id="task with spaces", workspace_path=tmp_path)
 
 
 def test_exec_result_attributes() -> None:
@@ -188,7 +205,7 @@ async def test_docker_sandbox_start_cancellation_cleans_up(
 
 
 def test_stream_collector_small_output(tmp_path: Path) -> None:
-    """Small output <= max_head is kept in memory with no spill file created on disk."""
+    """Small output <= max_head + max_tail is returned in full and preserved on disk."""
     logs_dir = tmp_path / ".oswald" / "logs"
     collector = StreamCollector(logs_dir=logs_dir, stream_name="stdout", max_head=100, max_tail=50)
 
@@ -197,6 +214,18 @@ def test_stream_collector_small_output(tmp_path: Path) -> None:
 
     res = collector.get_output()
     assert res == "Small output line 1\nSmall output line 2\n"
+    assert logs_dir.exists()
+    assert collector.log_filename is not None
+    saved_file = logs_dir / collector.log_filename
+    assert saved_file.exists()
+    assert saved_file.read_text() == "Small output line 1\nSmall output line 2\n"
+
+
+def test_stream_collector_empty_output(tmp_path: Path) -> None:
+    """Empty output returns empty string and creates no file on disk."""
+    logs_dir = tmp_path / ".oswald" / "logs"
+    collector = StreamCollector(logs_dir=logs_dir, stream_name="stdout")
+    assert collector.get_output() == ""
     assert not logs_dir.exists()
 
 
@@ -327,3 +356,114 @@ async def test_docker_run_early_cancellation_clean(
 
     with pytest.raises(asyncio.CancelledError):
         await runtime._run_docker(["info"])
+
+
+def test_stream_collector_rejects_symlinked_logs_dir(tmp_path: Path) -> None:
+    """StreamCollector refuses to write spill logs through a symlinked log directory."""
+    outside_dir = tmp_path / "outside_host_dir"
+    outside_dir.mkdir()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    oswald_dir = workspace / ".oswald"
+    oswald_dir.mkdir()
+    symlink_logs = oswald_dir / "logs"
+    symlink_logs.symlink_to(outside_dir)
+
+    collector = StreamCollector(logs_dir=symlink_logs, stream_name="stdout")
+    with pytest.raises(SandboxError, match="symlink"):
+        collector.feed(b"malicious output")
+
+    assert list(outside_dir.iterdir()) == []
+
+
+async def test_run_docker_continuous_output_exceeding_cap_does_not_hang(tmp_path: Path) -> None:
+    """Exceeding max_total_output_bytes on a noisy real subprocess drains pipes and exits cleanly."""
+    config = SandboxConfig(
+        task_id="task-cap",
+        workspace_path=tmp_path,
+        max_head_bytes=1024,
+        max_tail_bytes=1024,
+        max_total_output_bytes=4096,
+    )
+    runtime = DockerSandboxRuntime(config=config, docker_bin=sys.executable)
+
+    with pytest.raises(SandboxError, match="exceeded limit"):
+        await asyncio.wait_for(
+            runtime._run_docker(
+                [
+                    "-c",
+                    "import sys; data = b'x' * 65536\nwhile True: sys.stdout.buffer.write(data)",
+                ],
+                timeout_seconds=10.0,
+            ),
+            timeout=3.0,
+        )
+
+
+async def test_fake_sandbox_timeout_and_stop_kill_child_processes(
+    sample_config: SandboxConfig,
+) -> None:
+    """FakeSandboxRuntime terminates spawned child processes on timeout and stop()."""
+    sandbox = FakeSandboxRuntime(config=sample_config, execute_locally=True)
+    await sandbox.start()
+    marker_file = sample_config.workspace_path / "child_heartbeat.txt"
+
+    script = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', 'import pathlib, time; p = pathlib.Path(\"{marker_file}\");\\nwhile True:\\n p.write_text(str(time.time())); time.sleep(0.02)'])\n"
+        "time.sleep(10)\n"
+    )
+
+    with pytest.raises(SandboxTimeoutError):
+        await sandbox.exec_command([sys.executable, "-c", script], timeout_seconds=0.2)
+
+    if marker_file.exists():
+        marker_file.unlink()
+    await asyncio.sleep(0.1)
+    assert not marker_file.exists()
+
+    marker_file2 = sample_config.workspace_path / "child_heartbeat2.txt"
+    script2 = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', 'import pathlib, time; p = pathlib.Path(\"{marker_file2}\");\\nwhile True:\\n p.write_text(str(time.time())); time.sleep(0.02)'])\n"
+        "time.sleep(10)\n"
+    )
+    task = asyncio.create_task(
+        sandbox.exec_command([sys.executable, "-c", script2], timeout_seconds=10.0)
+    )
+    await asyncio.sleep(0.1)
+    await sandbox.stop()
+    task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await task
+    if marker_file2.exists():
+        marker_file2.unlink()
+    await asyncio.sleep(0.1)
+    assert not marker_file2.exists()
+
+
+async def test_docker_sandbox_exec_sandbox_error_kills_container(
+    sample_config: SandboxConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SandboxError during exec_command terminates container to stop runaway processes."""
+    runtime = DockerSandboxRuntime(config=sample_config)
+    runtime._status = SandboxStatus.RUNNING
+
+    calls: list[list[str]] = []
+
+    async def mock_run_docker(args: object, **kwargs: object) -> tuple[int, str, str]:
+        if isinstance(args, (list, tuple)):
+            calls.append(list(args))
+            if "exec" in args:
+                raise SandboxError("output cap exceeded", task_id="task-42")
+        return 0, "", ""
+
+    monkeypatch.setattr(runtime, "_run_docker", mock_run_docker)
+
+    with pytest.raises(SandboxError):
+        await runtime.exec_command(["sleep", "100"])
+
+    assert runtime.status == SandboxStatus.FAILED
+    assert any("kill" in c and runtime.container_name in c for c in calls)
