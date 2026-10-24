@@ -1,8 +1,11 @@
 """Fake sandbox runtime for deterministic unit testing without Docker daemon."""
 
 import asyncio
+import os
+import signal
 import time
 from collections import deque
+from contextlib import suppress
 from pathlib import Path
 
 from oswald.core.sandbox.exceptions import (
@@ -21,6 +24,17 @@ class FakeSandboxRuntime:
         self._status: SandboxStatus = SandboxStatus.PENDING
         self.executed_commands: list[list[str]] = []
         self._mock_responses: deque[ExecResult] = deque()
+        self._active_procs: set[asyncio.subprocess.Process] = set()
+
+    @staticmethod
+    async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
+        with suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        if proc.returncode is None:
+            with suppress(ProcessLookupError):
+                proc.kill()
+        with suppress(Exception):
+            await proc.wait()
 
     @property
     def config(self) -> SandboxConfig:
@@ -72,6 +86,7 @@ class FakeSandboxRuntime:
         if self._execute_locally:
             start = time.perf_counter()
             workspace = Path(self._config.workspace_path)
+            merged_env = {**os.environ, **env} if env is not None else None
             proc: asyncio.subprocess.Process | None = None
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -79,22 +94,26 @@ class FakeSandboxRuntime:
                     cwd=str(workspace),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    env=env,
+                    env=merged_env,
+                    start_new_session=True,
                 )
+                self._active_procs.add(proc)
                 stdout_b, stderr_b = await asyncio.wait_for(
                     proc.communicate(),
                     timeout=timeout_seconds,
                 )
             except (TimeoutError, asyncio.CancelledError) as exc:
                 if proc is not None:
-                    proc.kill()
-                    await proc.wait()
+                    await self._terminate_process_group(proc)
                 if isinstance(exc, TimeoutError):
                     raise SandboxTimeoutError(
                         f"Command timed out after {timeout_seconds}s: {' '.join(cmd)}",
                         task_id=self._config.task_id,
                     ) from exc
                 raise
+            finally:
+                if proc is not None:
+                    self._active_procs.discard(proc)
 
             return ExecResult(
                 exit_code=proc.returncode if proc.returncode is not None else 0,
@@ -113,6 +132,9 @@ class FakeSandboxRuntime:
 
     async def stop(self) -> None:
         self._status = SandboxStatus.STOPPED
+        for proc in list(self._active_procs):
+            await self._terminate_process_group(proc)
+        self._active_procs.clear()
 
     async def is_running(self) -> bool:
         return self._status == SandboxStatus.RUNNING
