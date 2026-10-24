@@ -28,6 +28,7 @@
 - [Developer Workflow](#developer-workflow)
 - [Architectural Boundaries](#architectural-boundaries)
 - [Documentation](#documentation)
+- [Community](#community)
 - [Contributing](#contributing)
 
 ---
@@ -42,13 +43,13 @@ OSWALD transitions deterministically through four specialized roles, passing imm
 [ Git PR / Push ] ◄── [ Human Approval Gate ] ◄── review.md ◄─────┴──► ( Tester ) ──► test-results.md ──► ( Reviewer )
 ```
 
-| Stage | Role | Tool Permissions | Output Artifact |
-| :--- | :--- | :--- | :--- |
-| **1. Planner** | Analyzes problem statement, resolves ambiguities | Read-only workspace inspection | `spec.md` |
-| **2. Coder** | Implements specification in Docker sandbox | File edit, bash in sandbox | `changes.md` + diff |
-| **3. Tester** | Authors and runs test suites inside sandbox | Test runner in sandbox | `test-results.md` |
-| **4. Reviewer** | Evaluates code against specification & coverage | Read-only diff & spec | `review.md` (verdict) |
-| **Approval Gate** | **Human Technical Sign-off** | Human reviewer inspects diff | PR creation unblocked |
+| Stage             | Role                                             | Tool Permissions               | Output Artifact       |
+| :---------------- | :----------------------------------------------- | :----------------------------- | :-------------------- |
+| **1. Planner**    | Analyzes problem statement, resolves ambiguities | Read-only workspace inspection | `spec.md`             |
+| **2. Coder**      | Implements specification in Docker sandbox       | File edit, bash in sandbox     | `changes.md` + diff   |
+| **3. Tester**     | Authors and runs test suites inside sandbox      | Test runner in sandbox         | `test-results.md`     |
+| **4. Reviewer**   | Evaluates code against specification & coverage  | Read-only diff & spec          | `review.md` (verdict) |
+| **Approval Gate** | **Human Technical Sign-off**                     | Human reviewer inspects diff   | PR creation unblocked |
 
 > **Security Rule:** Agents are strictly forbidden from pushing branches or creating PRs directly. All VCS mutations require explicit human approval.
 
@@ -56,24 +57,26 @@ OSWALD transitions deterministically through four specialized roles, passing imm
 
 ## Tech Stack
 
-* **Language & Runtime:** Python 3.12+, native `asyncio`
-* **Package Management:** [`uv`](https://docs.astral-sh/uv/) (blazing fast dependency sync & pinned `uv.lock`)
-* **API & Job Queue:** [FastAPI](https://fastapi.tiangolo.com/) + [Taskiq](https://taskiq-python.github.io/) (Redis broker)
-* **LLM Engine:** Raw Anthropic SDK via provider-neutral `LLMClient` protocol
-* **Data Contracts:** [Pydantic v2](https://docs.pydantic.dev/) (immutable schemas, zero ORM coupling)
-* **Backing Services:** PostgreSQL 16 + Redis 7 (orchestrated via Docker Compose)
-* **Quality Tooling:** `ruff` (lint/format), `mypy` (strict types), `import-linter` (boundary contracts), `pytest`
+- **Language & Runtime:** Python 3.12+, native `asyncio`
+- **Package Management:** [`uv`](https://docs.astral-sh/uv/) (blazing fast dependency sync & pinned `uv.lock`)
+- **API & Job Queue:** [FastAPI](https://fastapi.tiangolo.com/) + [Taskiq](https://taskiq-python.github.io/) (Redis broker)
+- **LLM Engine:** Raw Anthropic SDK via provider-neutral `LLMClient` protocol
+- **Data Contracts:** [Pydantic v2](https://docs.pydantic.dev/) (immutable schemas, zero ORM coupling)
+- **Backing Services:** PostgreSQL 16 + Redis 7 (orchestrated via Docker Compose)
+- **Quality Tooling:** `ruff` (lint/format), `mypy` (strict types), `import-linter` (boundary contracts), `pytest`
 
 ---
 
 ## Quickstart
 
 ### Prerequisites
-* Python 3.12+
-* [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
-* Docker & Docker Compose
+
+- Python 3.12+
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
+- Docker & Docker Compose
 
 ### 1. Clone & Setup
+
 ```bash
 git clone https://github.com/Oswald-Agent/Oswald.git
 cd Oswald
@@ -86,12 +89,14 @@ uv sync
 ```
 
 ### 2. Start Backing Services
+
 ```bash
 # Starts local PostgreSQL and Redis containers in background
 make up
 ```
 
 ### 3. Run Verification Suite
+
 ```bash
 # Runs ruff, mypy, import-linter, and unit tests
 make check
@@ -133,6 +138,14 @@ OSWALD enforces hard architectural boundaries via `import-linter` (enforced on e
 
 - [Architecture Specification](docs/architecture.md) — System architecture, orchestrator state machine, and component boundaries.
 - [Contributing Guidelines](CONTRIBUTING.md) — Developer setup, Makefile workflow, and PR conventions.
+
+---
+
+## Community
+
+Connect with the OSWALD community on Slack to ask questions, share ideas, and discuss contributions.
+
+[![Slack](https://img.shields.io/badge/chat-on_slack-purple.svg?style=for-the-badge&logo=slack)](https://join.slack.com/t/oswaldheadquarters/shared_invite/zt-4e7y8ltcy-oppiIxdJ0CBRrm6MwPkFHw)
 
 ---
 
